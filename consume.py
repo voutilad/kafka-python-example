@@ -1,65 +1,108 @@
 #!/usr/bin/env python3
 import os
+import sys
 
 from uuid import uuid4
-from time import time_ns
 
 from confluent_kafka import Consumer
 from confluent_kafka.serialization import (
-    StringSerializer, SerializationContext, MessageField
+    SerializationContext, MessageField
 )
-from confluent_kafka.schema_registry import Schema, SchemaRegistryClient
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.error import SchemaRegistryError
 from confluent_kafka.schema_registry.avro import AvroDeserializer
+from confluent_kafka.schema_registry.protobuf import ProtobufDeserializer
 
-from model import SensorValue
+from clickstream_key_pb2 import Key
+from click import Click
 
 
-USERNAME = os.environ.get("REDPANDA_SASL_USERNAME", "admin")
+USERNAME = os.environ.get("REDPANDA_SASL_USERNAME", "")
 PASSWORD = os.environ.get("REDPANDA_SASL_PASSWORD", "")
 SASL_MECH = os.environ.get("REDPANDA_SASL_MECHANISM", "SCRAM-SHA-256")
-BOOTSTRAP = os.environ.get("REDPANDA_BROKERS", "")
-SR_URL = os.environ.get("REDPANDA_SCHEMA_REGISTRY", "")
-TOPIC = os.environ.get("REDPANDA_TOPIC", "sensor_sample")
+BOOTSTRAP = os.environ.get("REDPANDA_BROKERS", "localhost:9092")
+SR_URL = os.environ.get("REDPANDA_SCHEMA_REGISTRY", "http://localhost:8081")
+TOPIC = os.environ.get("REDPANDA_TOPIC", "clickstream")
+TLS = os.environ.get("REDPANDA_TLS", "")
 
 
-sr_client = SchemaRegistryClient({
-    "url": SR_URL,
-    "basic.auth.user.info": f"{USERNAME}:{PASSWORD}",
-})
-sensor_schema = sr_client.get_latest_version(f"{TOPIC}-value")
+## Create a Schema Registry Client, configured for auth if needed.
+sr_client = SchemaRegistryClient({"url": SR_URL})
+if USERNAME and PASSWORD:
+    sr_client.update({"basic.auth.user.info": f"{USERNAME}:{PASSWORD}"})
 
-avro_deserializer = AvroDeserializer(
-    sr_client,
-    sensor_schema.schema.schema_str,
-    SensorValue.from_dict
+## Note: we don't need to fetch the protobuf schema for the key because it's
+## effectively already defined in the clickstream_key_pb2.
+
+## Retrieve our Value Schema. It should have been added via:
+##  $ rpk registry schema create \
+##    "${REDPANDA_TOPIC}-value" --schema clickstream-value.avsc
+value_schema = None
+try:
+    value_schema = sr_client.get_latest_version(f"{TOPIC}-value")
+except SchemaRegistryError as e:
+    print(f"Failed to fetch schema '{TOPIC}-value': {e}", file=sys.stderr)
+    sys.exit(1)
+
+## Configure the Consumer with optional authentication & TLS settings.
+config = {
+    "bootstrap.servers": BOOTSTRAP,
+    "auto.offset.reset": "earliest",
+    "enable.auto.commit": True,
+    "group.id": "kafka-python-example",
+    "group.instance.id": f"kafka-python-example-{uuid4()}"
+}
+if USERNAME and PASSWORD:
+    if TLS:
+        config.update({"security.protocol": "SASL_SSL"})
+    else:
+        print(
+            "warning: this configuration is unsupported by Redpanda", 
+            file=sys.stderr
+        )
+        config.update({"security.protocol": "SASL_PLAIN"})
+    config.update({
+        "sasl.username": USERNAME,
+        "sasl.password": PASSWORD,
+        "sasl.mechanism": SASL_MECH,
+    })
+elif TLS:
+    config.update({"security.protocol": "SSL"})
+consumer = Consumer(config)
+
+## Configure our Serializers.
+key_deserializer = ProtobufDeserializer(Key, {"use.deprecated.format": False})
+value_deserializer = AvroDeserializer(
+    sr_client, value_schema.schema.schema_str, Click.from_dict
 )
 
-consumer = Consumer({
-    "bootstrap.servers": BOOTSTRAP,
-    "security.protocol": "SASL_SSL",
-    "sasl.mechanism": SASL_MECH,
-    "sasl.username": USERNAME,
-    "sasl.password": PASSWORD,
-    "auto.offset.reset": "earliest",
-    "group.id": "kafka-python-example",
-})
+## Subscribe to our topic.
 consumer.subscribe([TOPIC])
 
-
+ticker = 0
 while True:
     try:
-        msg = consumer.poll(2)
+        ticker += 1
+        msg = consumer.poll(0.5) # poll aggressively to quickly catch ctrl-c
         if msg is None:
-            print("...tick")
+            if ticker == 10:
+                print("...waiting for data", file=sys.stderr)
+                ticker = 0
             continue
-        value = avro_deserializer(
+        key = key_deserializer(
+            msg.key(),
+            SerializationContext(msg.topic(), MessageField.KEY)
+        )
+        value = value_deserializer(
             msg.value(),
             SerializationContext(msg.topic(), MessageField.VALUE)
         )
-        print(f"Got value @ {msg.partition()}: key={msg.key()}, {value}")
+        key_str = f"{{uuid: {key.uuid}, seq: {key.seq}}}"
+        print(f"{msg.partition()}/{msg.offset()}: ({key_str}, {value})")
 
     except Exception as e:
-        print(e)
+        print(e, file=sys.stderr)
         break
 
+## Be kind and say goodbye.
 consumer.close()
