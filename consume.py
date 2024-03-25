@@ -27,9 +27,10 @@ TLS = os.environ.get("REDPANDA_TLS", "")
 
 
 ## Create a Schema Registry Client, configured for auth if needed.
-sr_client = SchemaRegistryClient({"url": SR_URL})
+sr_config = {"url": SR_URL}
 if USERNAME and PASSWORD:
-    sr_client.update({"basic.auth.user.info": f"{USERNAME}:{PASSWORD}"})
+    sr_config.update({"basic.auth.user.info": f"{USERNAME}:{PASSWORD}"})
+sr_client = SchemaRegistryClient(sr_config)
 
 ## Note: we don't need to fetch the protobuf schema for the key because it's
 ## effectively already defined in the clickstream_key_pb2.
@@ -42,6 +43,7 @@ try:
     value_schema = sr_client.get_latest_version(f"{TOPIC}-value")
 except SchemaRegistryError as e:
     print(f"Failed to fetch schema '{TOPIC}-value': {e}", file=sys.stderr)
+    print(f">> Did you run `rpk registry schema create ...`?", file=sys.stderr)
     sys.exit(1)
 
 ## Configure the Consumer with optional authentication & TLS settings.
